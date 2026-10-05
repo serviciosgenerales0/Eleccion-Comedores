@@ -159,21 +159,16 @@ let cacheGuardias = { GUARDIA_A: null, GUARDIA_B: null, GUARDIA_C: null };
 let LIMITES = {}, TRABAJADORES = {}, todosLosRegistros = [], sistemaForzado = null, horaInicio = "", horaFin = "";
 let vipsPendientes = {}, ELECCIONES_ACTUALES = {};
 
-// Escapa texto antes de insertarlo en innerHTML — evita XSS si un nombre/campo
-// del Excel (o cualquier dato leído desde Firebase) contiene HTML/JS.
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[ch]));
 }
 
-// Sanitiza un valor antes de usarlo como sufijo de clase CSS (ej. badge-obrero)
 function claseSegura(str) {
   return String(str || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
 }
 
-// CORRECCIÓN: lee fecha+hora de una celda de Excel de forma robusta.
-// - Devuelve el ISO con el offset fijo de Perú (-05:00).
 function celdaAIsoPeru(valorFecha, valorHora) {
   let y, mo, d, hh = 0, mm = 0;
 
@@ -187,9 +182,9 @@ function celdaAIsoPeru(valorFecha, valorHora) {
     let [p1, p2, p3] = partes.map(n => parseInt(n, 10));
     if (isNaN(p1) || isNaN(p2) || isNaN(p3)) return null;
     if (p3 < 100) p3 += 2000;
-    if (p1 > 12 && p2 <= 12) { d = p1; mo = p2; }       // formato DD/MM/YYYY confirmado
-    else if (p2 > 12 && p1 <= 12) { d = p2; mo = p1; }  // venía como MM/DD/YYYY: se corrige
-    else { d = p1; mo = p2; }                            // ambiguo: se asume DD/MM (estándar Perú)
+    if (p1 > 12 && p2 <= 12) { d = p1; mo = p2; }       
+    else if (p2 > 12 && p1 <= 12) { d = p2; mo = p1; }  
+    else { d = p1; mo = p2; }                            
     y = p3;
   }
 
@@ -215,6 +210,9 @@ document.addEventListener('DOMContentLoaded', () => {
   db = firebase.database(); auth = firebase.auth();
   
   db.ref('.info/serverTimeOffset').on('value', snap => { serverTimeOffset = snap.val() || 0; });
+
+  // ¡RELOJ ATÓMICO VISUAL PARA EL ADMIN! (Verifica la UI cada 1 segundo)
+  setInterval(actualizarUIControlSistema, 1000);
 
   auth.onAuthStateChanged(user => {
     if (user) { 
@@ -279,10 +277,8 @@ function iniciarListenersGuardia() {
   escuchar(`${basePath}/vips_pendientes`, snap => { vipsPendientes = snap.val() || {}; verificarDisparoVIPs(); });
   escuchar(`${basePath}/elecciones`, snap => { ELECCIONES_ACTUALES = snap.val() || {}; actualizarTablas(); verificarDisparoVIPs(); });
   
-  document.getElementById('search-input').addEventListener('input', filtrarTabla);
-  document.getElementById('search-faltantes')?.addEventListener('input', renderizarFaltantes);
-  
-  intervalCurador = setInterval(() => { actualizarUIControlSistema(); forzarSincronizacionConteos(false); }, 15000);
+  // El curador de 15 segundos ahora solo se encarga de forzar la sincronización en background
+  intervalCurador = setInterval(() => { forzarSincronizacionConteos(false); }, 15000);
 }
 
 function procesarResumenHistoricoArchivoUnico() {
@@ -319,7 +315,6 @@ function procesarResumenHistoricoArchivoUnico() {
          }
       });
 
-      // Asegurar que existan nodos de conteos para todos los comedores
       Object.keys(LIMITES).forEach(c => { if (!conteos[c]) conteos[c] = { obrero: 0, empleado: 0 }; });
 
       if(Object.keys(elecciones).length === 0) { alert("No se encontraron registros válidos en el Excel."); return; }
@@ -450,12 +445,28 @@ function procesarExcel() {
               if (vip !== "") { preVips[dni] = {nombre: nombre, categoria: cat, comedor: vip}; }
           }
       }); }
+
+      let limKeysNorm = {};
+      Object.keys(lim).forEach(k => { limKeysNorm[k.toLowerCase().trim()] = k; });
+      let vipsInvalidos = [];
+      Object.keys(trab).forEach(dni => {
+          if (trab[dni].vip === "") return;
+          const normalizado = trab[dni].vip.toLowerCase().trim();
+          if (limKeysNorm[normalizado]) {
+              const nombreCanonico = limKeysNorm[normalizado];
+              trab[dni].vip = nombreCanonico;
+              if (preVips[dni]) preVips[dni].comedor = nombreCanonico;
+          } else {
+              vipsInvalidos.push(`${trab[dni].nombre} (DNI ${dni}): "${trab[dni].vip}"`);
+              trab[dni].vip = "";
+              delete preVips[dni];
+          }
+      });
       
       let updates = {}; const basePath = `evento/guardias/${guardiaSeleccionada}`;
       updates[`${basePath}/datos_iniciales`] = { limites: lim, horaInicio: isoInicio, horaFin: isoFin, horaInicioTxt: hInicioTxt, horaFinTxt: hFinTxt, sistemaForzado: null };
       updates[`${basePath}/trabajadores`] = trab; updates[`${basePath}/vips_pendientes`] = preVips; 
 
-      // Inicializa conteos en 0 para no chocar con las reglas de Firebase
       const snapConteosActuales = await db.ref(`${basePath}/conteos`).once('value');
       const conteosActuales = snapConteosActuales.val() || {};
       Object.keys(lim).forEach(c => {
@@ -466,6 +477,9 @@ function procesarExcel() {
           let msj = `Excel cargado exitosamente en ${guardiaSeleccionada.replace('_', ' ')}.`;
           if (erroresHorario.length > 0) {
               msj += `\n\n⚠️ No se pudo leer la fecha/hora de: ${erroresHorario.join(' y ')}.\nRevisa la pestaña CONFIGURACION (columna B = fecha, columna C = hora) y vuelve a subir el Excel.`;
+          }
+          if (vipsInvalidos.length > 0) {
+              msj += `\n\n⚠️ Estos trabajadores tenían un comedor VIP que no coincide con ningún comedor de la hoja COMEDORES, así que NO quedaron como VIP (elegirán normalmente):\n${vipsInvalidos.join('\n')}`;
           }
           alert(msj);
           document.getElementById('excel-file').value = '';
@@ -496,11 +510,13 @@ function actualizarUIControlSistema() {
   if (activo) { 
     btnAbrir.textContent = "✓ Abierto"; btnAbrir.disabled = true; btnAbrir.style.opacity = "0.6"; btnAbrir.style.cursor = "default";
     btnCerrar.textContent = "✕ Cerrar Manual"; btnCerrar.disabled = false; btnCerrar.style.opacity = "1"; btnCerrar.style.cursor = "pointer";
+    
     badgeSuperior.className = "status-badge status-open";
     textoSuperior.textContent = "Sistema Abierto";
   } else { 
     btnAbrir.textContent = "¿Quieres Habilitar?"; btnAbrir.disabled = false; btnAbrir.style.opacity = "1"; btnAbrir.style.cursor = "pointer";
     btnCerrar.textContent = "✕ Está Cerrado"; btnCerrar.disabled = true; btnCerrar.style.opacity = "0.6"; btnCerrar.style.cursor = "default";
+    
     badgeSuperior.className = "status-badge status-closed";
     textoSuperior.textContent = "Sistema Cerrado";
   }
